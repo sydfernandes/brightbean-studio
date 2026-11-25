@@ -70,6 +70,111 @@ def sync_post_scheduled_at(post):
 
 _INITIAL_STATUSES = {"draft", "scheduled"}
 
+#: Public API / composer values for Instagram and Facebook.
+#: ``feed`` is the absence of a hint: today's publish path (a feed image, a
+#: regular Facebook video, or an Instagram Reel for a single video).
+PUBLISH_FORMATS = ("feed", "reel", "story")
+META_PUBLISH_FORMAT_PLATFORMS = frozenset({"facebook", "instagram", "instagram_login"})
+
+
+def public_post_type(platform_extra: dict | None) -> str:
+    """The feed/reel/story choice stored on a platform post, defaulting to feed."""
+    hint = (platform_extra or {}).get("post_type")
+    if hint in ("reel", "story"):
+        return hint
+    return "feed"
+
+
+def apply_publish_format(
+    extra: dict | None,
+    *,
+    platform: str,
+    post_type: str,
+    media_types: list[str],
+) -> dict:
+    """Return ``extra`` with a feed/reel/story choice applied.
+
+    ``feed`` clears a stored hint so publishing stays on today's default path.
+    Raises ``ValueError`` when the platform or the attached media cannot
+    honour the choice. ``media_types`` is the ordered list of usable
+    attachments (one entry per file the publisher would upload).
+    """
+    if post_type not in PUBLISH_FORMATS:
+        raise ValueError("post_type must be one of: feed, reel, story.")
+    if platform not in META_PUBLISH_FORMAT_PLATFORMS:
+        raise ValueError(
+            f"post_type is only supported for Instagram and Facebook. {platform} keeps its existing publish path."
+        )
+    updated = {**(extra or {})}
+    if post_type == "feed":
+        updated.pop("post_type", None)
+        return updated
+    if post_type == "reel":
+        if media_types != ["video"]:
+            raise ValueError("post_type 'reel' needs exactly one video.")
+        updated["post_type"] = "reel"
+        return updated
+    if media_types not in (["image"], ["video"]):
+        raise ValueError("post_type 'story' needs exactly one image or video.")
+    updated["post_type"] = "story"
+    return updated
+
+
+def apply_composer_publish_format(extra: dict | None, choice: str, media_types: list[str]) -> dict:
+    """Composer select: ``feed`` / ``reel`` / ``story``.
+
+    A legacy ``video`` value (the old Facebook "regular Page video" option)
+    and anything else clear the hint. The hint is stored only while the
+    attachments can still satisfy it, matching the Reel selector.
+    """
+    updated = {**(extra or {})}
+    if choice == "reel" and media_types == ["video"]:
+        updated["post_type"] = "reel"
+    elif choice == "story" and len(media_types) == 1 and media_types[0] in ("image", "video"):
+        updated["post_type"] = "story"
+    else:
+        updated.pop("post_type", None)
+    return updated
+
+
+def ordered_usable_media_types(post) -> list[str]:
+    """Usable attachment types in composer order, one entry per file."""
+    return list(
+        _usable_attachments()
+        .filter(post_id=post.pk)
+        .order_by("position")
+        .values_list("media_asset__media_type", flat=True)
+    )
+
+
+def assign_publish_format(post, post_type: str) -> None:
+    """Store ``post_type`` on every Instagram and Facebook child of ``post``.
+
+    Other platforms on the same post are left untouched. Raises ``ValueError``
+    when the post has no Instagram or Facebook target, or the media cannot
+    satisfy the choice. Validates every target before writing any of them.
+    """
+    children = list(post.platform_posts.select_related("social_account"))
+    meta = [pp for pp in children if pp.social_account.platform in META_PUBLISH_FORMAT_PLATFORMS]
+    if not meta:
+        raise ValueError("post_type is only supported for Instagram and Facebook.")
+    media_types = ordered_usable_media_types(post)
+    planned = [
+        (
+            pp,
+            apply_publish_format(
+                pp.platform_extra,
+                platform=pp.social_account.platform,
+                post_type=post_type,
+                media_types=media_types,
+            ),
+        )
+        for pp in meta
+    ]
+    for pp, extra in planned:
+        pp.platform_extra = extra
+        pp.save(update_fields=["platform_extra", "updated_at"])
+
 
 def create_post(
     *,
@@ -85,6 +190,7 @@ def create_post(
     author=None,
     status: str = "draft",
     platform_overrides: dict[Any, dict[str, str | None]] | None = None,
+    post_type: str | None = None,
 ):
     """Create a ``Post`` + one ``PlatformPost`` for ``social_account``.
 
@@ -113,6 +219,10 @@ def create_post(
     * Media assets are attached in order by their position in
       ``media_asset_ids``. They must already live in the workspace's
       media library.
+    * ``post_type`` (``feed``, ``reel``, or ``story``) is optional and only
+      valid for Instagram and Facebook. It is stored on
+      ``PlatformPost.platform_extra`` — no schema change. Omit it to leave
+      the default publish path. ``feed`` clears a hint.
 
     Returns the persisted ``Post`` with one ``PlatformPost`` child.
     """
@@ -172,13 +282,25 @@ def create_post(
         if missing:
             raise ValueError(f"Media asset(s) not found in workspace {workspace.id}: {missing}")
 
+    ordered_types = [asset_map[u].media_type for _mid, u in resolved if u is not None and asset_map[u].file]
+    platform_extra: dict = {}
+    if post_type is not None:
+        platform_extra = apply_publish_format(
+            {},
+            platform=social_account.platform,
+            post_type=post_type,
+            media_types=ordered_types,
+        )
+
     if status == "scheduled":
         # A new post has no platform_extra, so a Pinterest pin has no board
         # yet and is refused here: it can be created as a draft, given a
         # board in the composer, and scheduled from there.
         reason = publish_blocker(
             social_account,
-            media_types=usable_media_types(asset_map.values()),
+            media_types=set(ordered_types),
+            platform_extra=platform_extra,
+            media_count=len(ordered_types),
         )
         if reason:
             raise ValueError(reason)
@@ -211,6 +333,7 @@ def create_post(
             platform_specific_title=override.get("title"),
             platform_specific_caption=override.get("caption"),
             platform_specific_first_comment=override.get("first_comment"),
+            platform_extra=platform_extra,
         )
         for position, (_mid, u) in enumerate(resolved):
             # ``u`` is validated non-None and present in ``asset_map`` above
@@ -443,21 +566,52 @@ def media_blocker(social_account, *, media_types) -> str:
     return ""
 
 
-def publish_blocker(social_account, *, media_types, platform_extra: dict | None = None) -> str:
+def _publish_format_blocker(hint: str, media_types: set[str], media_count: int | None) -> str:
+    """Why a stored Reel or Story hint cannot publish with this media, or ""."""
+    if hint == "reel":
+        count = media_count if media_count is not None else (1 if media_types == {"video"} else len(media_types))
+        if count == 1 and media_types == {"video"}:
+            return ""
+        return "A Reel needs exactly one video. Attach one before scheduling this post."
+    if hint == "story":
+        # Without a count, one distinct image/video type is the best the set
+        # can say. Callers that know the attachment count pass it, so two
+        # images (still ``{"image"}``) are refused.
+        if media_count is None:
+            count = 1 if len(media_types) == 1 and media_types <= {"image", "video"} else len(media_types)
+        else:
+            count = media_count
+        if count == 1 and media_types in ({"image"}, {"video"}):
+            return ""
+        return "A Story needs exactly one image or video. Attach one before scheduling this post."
+    return ""
+
+
+def publish_blocker(
+    social_account,
+    *,
+    media_types,
+    platform_extra: dict | None = None,
+    media_count: int | None = None,
+) -> str:
     """Why a post can't publish to ``social_account`` as it stands, or "".
 
     The one statement of this rule. The publisher checks it before calling a
     platform, and every path that schedules a post checks it first so the user
     hears about it then rather than after the post's other platforms have gone
     out. Only failures that are certain before the platform is ever called: the
-    media a platform can't do without (``media_blocker``), and a pin with no
-    board, which our own Pinterest provider refuses.
+    media a platform can't do without (``media_blocker``), a pin with no
+    board, which our own Pinterest provider refuses, and a Reel or Story hint
+    the attached media can no longer satisfy.
     """
     reason = media_blocker(social_account, media_types=media_types)
     if reason:
         return reason
     if social_account.platform == "pinterest" and not (platform_extra or {}).get("board_id"):
         return "Pinterest needs a board for every pin. Choose one for this post in the composer before scheduling it."
+    hint = (platform_extra or {}).get("post_type")
+    if hint in ("reel", "story") and social_account.platform in META_PUBLISH_FORMAT_PLATFORMS:
+        return _publish_format_blocker(hint, set(media_types), media_count)
     return ""
 
 
@@ -469,16 +623,29 @@ def require_publishable(platform_post, *, media_types=None) -> None:
     """
     if media_types is None:
         media_types = post_media_types(platform_post.post)
+    hint = (platform_post.platform_extra or {}).get("post_type")
+    # Only a Reel or Story needs the attachment *count* (a set of types cannot
+    # tell one image from several). Skip the query for every other post.
+    media_count = None
+    if hint in ("reel", "story"):
+        media_count = _usable_attachments().filter(post_id=platform_post.post_id).count()
     reason = publish_blocker(
         platform_post.social_account,
         media_types=media_types,
         platform_extra=platform_post.platform_extra,
+        media_count=media_count,
     )
     if reason:
         raise ValueError(reason)
 
 
-def media_change_blocker(post, *, media_types_after) -> str:
+def media_change_blocker(
+    post,
+    *,
+    media_types_after,
+    media_count_after: int | None = None,
+    format_override: str | None = None,
+) -> str:
     """Why a media change would strand a scheduled row, or "".
 
     Scheduling checks the post as it stood then; this stops the media a
@@ -499,4 +666,14 @@ def media_change_blocker(post, *, media_types_after) -> str:
                 f"This post is scheduled to {platform}, which needs {need} on it. "
                 f"Keep one on the post, or unschedule it for {platform} first."
             )
+        if format_override is not None and child.social_account.platform in META_PUBLISH_FORMAT_PLATFORMS:
+            # The request is replacing the stored choice, so judge the media
+            # against the new one. ``feed`` clears the hint.
+            hint = "" if format_override == "feed" else format_override
+        else:
+            hint = (child.platform_extra or {}).get("post_type")
+        if hint in ("reel", "story") and child.social_account.platform in META_PUBLISH_FORMAT_PLATFORMS:
+            reason = _publish_format_blocker(hint, set(media_types_after), media_count_after)
+            if reason:
+                return reason
     return ""

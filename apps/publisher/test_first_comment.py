@@ -355,6 +355,26 @@ class ScheduleFirstCommentTest(TestCase):
 
         task.assert_not_called()
 
+    def test_a_story_does_not_queue_a_first_comment(self):
+        self.platform_post.platform_extra = {"post_type": "story"}
+        self.platform_post.save(update_fields=["platform_extra"])
+
+        with patch("apps.publisher.engine._post_first_comment_task") as task:
+            PublishEngine()._maybe_schedule_first_comment(self.platform_post)
+
+        task.assert_not_called()
+        self.platform_post.refresh_from_db()
+        self.assertEqual(self.platform_post.first_comment_status, Status.NONE)
+
+    def test_a_reel_still_queues_a_first_comment(self):
+        self.platform_post.platform_extra = {"post_type": "reel"}
+        self.platform_post.save(update_fields=["platform_extra"])
+
+        with patch("apps.publisher.engine._post_first_comment_task") as task:
+            PublishEngine()._maybe_schedule_first_comment(self.platform_post)
+
+        task.assert_called_once()
+
     def test_a_post_without_a_first_comment_is_not_scheduled(self):
         self.post.first_comment = ""
         self.post.save(update_fields=["first_comment"])

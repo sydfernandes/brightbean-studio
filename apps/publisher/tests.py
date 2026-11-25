@@ -8,6 +8,7 @@ from django.utils import timezone
 
 from apps.publisher.engine import MAX_RETRIES, RETRY_BACKOFF, PublishEngine, _resolve_publish_credentials
 from apps.publisher.models import PublishLog, RateLimitState
+from providers.exceptions import PublishError
 from providers.types import AuthType, PostType, PublishResult
 
 
@@ -786,6 +787,27 @@ class ResolvePostTypeFromMediaTypeTest(SimpleTestCase):
             self._resolve("instagram_login", extra={"post_type": "story"}),
             PostType.STORY,
         )
+
+    def test_a_story_hint_with_one_image_is_a_story(self):
+        self.assertEqual(
+            self._resolve("instagram", first_media_type="image", extra={"post_type": "story"}),
+            PostType.STORY,
+        )
+        self.assertEqual(
+            self._resolve("facebook", first_media_type="image", extra={"post_type": "story"}),
+            PostType.STORY,
+        )
+
+    def test_a_story_hint_that_no_longer_fits_is_not_turned_into_a_feed_post(self):
+        with self.assertRaises(PublishError):
+            self._resolve("instagram", media_count=2, first_media_type="image", extra={"post_type": "story"})
+        with self.assertRaises(PublishError):
+            self._resolve("facebook", media_count=0, first_media_type=None, extra={"post_type": "story"})
+
+    def test_a_lone_video_without_a_hint_is_still_a_reel_on_instagram_and_a_video_on_facebook(self):
+        self.assertEqual(self._resolve("instagram"), PostType.REEL)
+        self.assertEqual(self._resolve("facebook"), PostType.VIDEO)
+        self.assertEqual(self._resolve("facebook", extra={"post_type": "reel"}), PostType.REEL)
 
 
 def _attachment(media_type: str, url: str, *, has_file: bool = True):

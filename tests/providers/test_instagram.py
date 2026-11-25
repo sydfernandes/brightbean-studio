@@ -1106,6 +1106,72 @@ def test_an_image_story_is_sent_as_an_image(make_provider, create_url):
 
 
 @pytest.mark.parametrize(("make_provider", "create_url"), IG_PUBLISHERS)
+def test_a_story_container_omits_the_caption(make_provider, create_url):
+    """Instagram does not show a caption on a Story."""
+    provider = make_provider()
+
+    _publish(provider, text="Shown in the composer only", media_urls=[IMAGE_URL], post_type=PostType.STORY)
+
+    assert provider._request.call_args_list[0].kwargs["json"] == {
+        "media_type": "STORIES",
+        "image_url": IMAGE_URL,
+    }
+
+
+@pytest.mark.parametrize(("make_provider", "create_url"), IG_PUBLISHERS)
+def test_a_video_story_waits_for_the_container_before_media_publish(make_provider, create_url, monkeypatch):
+    """Video Stories must not call media_publish until the container is FINISHED."""
+    monkeypatch.setattr("providers.instagram.CONTAINER_POLL_INTERVAL", 0)
+    monkeypatch.setattr("providers.instagram_login.CONTAINER_POLL_INTERVAL", 0)
+    provider = make_provider()
+    provider._request = MagicMock(
+        side_effect=[
+            _resp({"id": "container-1"}),
+            _resp({"status_code": "IN_PROGRESS"}),
+            _resp({"status_code": "FINISHED"}),
+            _resp({"id": "media-1"}),
+        ]
+    )
+
+    result = provider.publish_post(
+        "token",
+        PublishContent(
+            text="not on the story",
+            media_urls=[VIDEO_URL],
+            post_type=PostType.STORY,
+            extra={"ig_user_id": "ig-1"},
+        ),
+    )
+
+    assert result.platform_post_id == "media-1"
+    create, first_poll, second_poll, publish = provider._request.call_args_list
+    assert create.args[:2] == ("POST", create_url)
+    assert create.kwargs["json"] == {"media_type": "STORIES", "video_url": VIDEO_URL}
+    assert first_poll.args[0] == "GET"
+    assert first_poll.kwargs["params"] == {"fields": "status_code,status"}
+    assert second_poll.args[0] == "GET"
+    assert publish.args[0] == "POST"
+    assert publish.args[1].endswith("/media_publish")
+    assert publish.kwargs["json"] == {"creation_id": "container-1"}
+
+
+@pytest.mark.parametrize(("make_provider", "create_url"), IG_PUBLISHERS)
+def test_feed_image_and_reel_payloads_are_unchanged(make_provider, create_url):
+    """Choosing a Story must not change the feed image or Reel container."""
+    provider = make_provider()
+    _publish(provider, text="Hello", media_urls=[IMAGE_URL], post_type=PostType.IMAGE)
+    assert provider._request.call_args_list[0].kwargs["json"] == {"caption": "Hello", "image_url": IMAGE_URL}
+
+    provider = make_provider()
+    _publish(provider, text="Watch", media_urls=[VIDEO_URL], post_type=PostType.REEL)
+    assert provider._request.call_args_list[0].kwargs["json"] == {
+        "caption": "Watch",
+        "media_type": "REELS",
+        "video_url": VIDEO_URL,
+    }
+
+
+@pytest.mark.parametrize(("make_provider", "create_url"), IG_PUBLISHERS)
 def test_a_carousel_video_child_is_sent_as_a_video(make_provider, create_url):
     """Same extension trap as the story branch, one level down: a presigned
     video child built as an image fails the container and strands the children

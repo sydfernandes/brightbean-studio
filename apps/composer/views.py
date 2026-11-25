@@ -55,6 +55,7 @@ from .models import (
 )
 from .services import (
     _require_approval_gate_passes,
+    apply_composer_publish_format,
     media_blocker,
     media_change_blocker,
     post_media_types,
@@ -268,32 +269,27 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
         pp.platform_specific_first_comment = override_comment if override_comment else None
 
         # Per-platform extras
-        if account.platform == "facebook" and f"facebook_panel_{acc_id}" in request.POST:
+        format_prefix = ""
+        if account.platform == "facebook":
+            format_prefix = "facebook"
+        elif account.platform in ("instagram", "instagram_login"):
+            format_prefix = "instagram"
+        if format_prefix and f"{format_prefix}_panel_{acc_id}" in request.POST:
             # Gated on the panel's hidden marker, which the composer renders for
-            # every selected Facebook account regardless of media: that keeps a
-            # non-composer save from wiping extras it never rendered, while
-            # still letting a composer save clear a hint whose video is gone.
+            # every selected Instagram or Facebook account regardless of media:
+            # that keeps a non-composer save from wiping extras it never
+            # rendered, while still letting a composer save clear a hint whose
+            # media is gone.
             #
-            # The Reel selector itself is omitted when the attachment set is not
-            # exactly one video. Clearing an earlier choice in that case is what
-            # stops removing or replacing media from leaving a stale Reel hint
-            # that sends a text or image post to Facebook's Reel endpoint.
+            # The selector itself is disabled (and therefore not submitted)
+            # unless exactly one image or video is attached. Clearing an
+            # earlier Reel or Story in that case stops a stale hint from
+            # sending the wrong media to a Story or Reel endpoint. Feed is the
+            # absence of a hint, which is today's publish path.
             extra = {**(pp.platform_extra or {})}
-            facebook_post_type = request.POST.get(f"facebook_post_type_{acc_id}", "").strip()
+            choice = request.POST.get(f"{format_prefix}_post_type_{acc_id}", "").strip()
             media_types = list(post.media_attachments.values_list("media_asset__media_type", flat=True)[:2])
-            has_exactly_one_video = media_types == ["video"]
-            if facebook_post_type == "reel" and has_exactly_one_video:
-                extra["post_type"] = "reel"
-            else:
-                # Only the deviation from the default is worth storing. A lone
-                # video already infers PostType.VIDEO at publish time, so a
-                # "video" hint restates what the media says and can only go
-                # wrong: if the attachment is later swapped for an image
-                # through the media endpoints, the hint would still route it to
-                # Facebook's video endpoint. Choosing regular video therefore
-                # clears the hint rather than recording it.
-                extra.pop("post_type", None)
-            pp.platform_extra = extra
+            pp.platform_extra = apply_composer_publish_format(extra, choice, media_types)
 
         elif account.platform == "youtube":
             tags_list = parse_and_truncate_youtube_tag_string(request.POST.get(f"yt_tags_{acc_id}", ""))
@@ -2575,7 +2571,16 @@ def remove_media(request, workspace_id, post_id, media_id):
         # last image off a pin, would leave it queued to fail. Plain text,
         # because the global htmx error toast shows the body as-is and a 4xx
         # doesn't swap.
-        reason = media_change_blocker(post, media_types_after=post_media_types(post, excluding=attachment))
+        remaining = list(
+            post.media_attachments.exclude(pk=attachment.pk)
+            .exclude(media_asset__file="")
+            .values_list("media_asset__media_type", flat=True)
+        )
+        reason = media_change_blocker(
+            post,
+            media_types_after=set(remaining),
+            media_count_after=len(remaining),
+        )
         if reason:
             return HttpResponse(reason, status=400, content_type="text/plain")
     PostMedia.objects.filter(id=media_id, post=post).delete()

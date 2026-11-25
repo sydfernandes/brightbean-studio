@@ -321,8 +321,6 @@ class InstagramLoginProvider(SocialProvider):
 
     def _publish_single(self, access_token: str, content: PublishContent) -> PublishResult:
         payload: dict = {}
-        if content.text:
-            payload["caption"] = content.text
 
         # Route on what the asset *is*, not only on which post types name a
         # video: any post type carrying a video has to reach a video field, or
@@ -332,6 +330,8 @@ class InstagramLoginProvider(SocialProvider):
         is_video = content.is_video(0)
 
         if content.post_type == PostType.STORY:
+            # Stories do not display a caption. Video containers are polled
+            # until FINISHED before media_publish; images use the same wait.
             payload["media_type"] = "STORIES"
             payload["video_url" if is_video else "image_url"] = url
         elif is_video or content.post_type in (PostType.REEL, PostType.VIDEO):
@@ -344,6 +344,9 @@ class InstagramLoginProvider(SocialProvider):
             payload["video_url"] = url
         else:
             payload["image_url"] = url
+
+        if content.text and content.post_type != PostType.STORY:
+            payload["caption"] = content.text
 
         container_id = self._create_container(access_token, payload)
         self._wait_for_container(access_token, container_id)

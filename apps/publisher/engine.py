@@ -552,6 +552,10 @@ class PublishEngine:
             return
         if not platform_post.effective_first_comment:
             return
+        # Stories have nowhere to hang a first comment. Queuing one would
+        # fail on Meta and retry until the comment budget is spent.
+        if (platform_post.platform_extra or {}).get("post_type") == "story":
+            return
         if platform_post.first_comment_status in (
             PlatformPost.FirstCommentStatus.PENDING,
             PlatformPost.FirstCommentStatus.POSTED,
@@ -741,6 +745,7 @@ class PublishEngine:
             account,
             media_types=usable_media_types(pm.media_asset for pm in attachments),
             platform_extra=platform_post.platform_extra,
+            media_count=sum(1 for pm in attachments if pm.media_asset.file),
         )
         if blocker:
             raise PublishError(blocker, platform=account.get_platform_display(), retryable=False)
@@ -933,6 +938,10 @@ class PublishEngine:
         if hint is PostType.REEL:
             # Every Reels API takes exactly one video.
             return media_count == 1 and first_media_type == "video"
+        if hint is PostType.STORY:
+            # A Story is exactly one image or one video. Anything else must
+            # not be sent to the Story endpoint.
+            return media_count == 1 and first_media_type in ("image", "video")
         if hint is PostType.VIDEO:
             # _publish_video posts media_urls[0] to the video endpoint as-is.
             return first_media_type == "video"
@@ -961,6 +970,16 @@ class PublishEngine:
             if hint not in valid_values:
                 logger.warning("Invalid post_type hint %r, ignoring", hint)
             elif not PublishEngine._hint_matches_media(PostType(hint), media_count, first_media_type):
+                if hint == PostType.STORY.value:
+                    # A stale Reel hint falls back to the media-inferred type so
+                    # a post can still go out. A stale Story must not: publishing
+                    # it as a feed post is a different post than the one that
+                    # was scheduled.
+                    raise PublishError(
+                        "A Story needs exactly one image or video.",
+                        platform=platform,
+                        retryable=False,
+                    )
                 logger.warning(
                     "Ignoring stale %s post_type hint: %d attachment(s), first is %r",
                     hint,

@@ -90,6 +90,9 @@ FACEBOOK_COMMENT_FIELDS = "id,message,created_time,from,parent,permalink_url"
 # Facebook Reels published through the API must be between 3 and 90 seconds.
 FACEBOOK_REEL_MIN_DURATION_SEC = 3
 FACEBOOK_REEL_MAX_DURATION_SEC = 90
+# Page video Stories are capped at 60 seconds. An unknown duration is allowed
+# through, the same way a Reel with no probed duration is.
+FACEBOOK_STORY_MAX_DURATION_SEC = 60
 
 # Facebook caps the ``attached_media`` array on a single feed post. Larger sets
 # must use the album-creation flow, which this provider does not implement.
@@ -131,7 +134,7 @@ class FacebookProvider(SocialProvider):
 
     @property
     def supported_post_types(self) -> list[PostType]:
-        return [PostType.TEXT, PostType.IMAGE, PostType.VIDEO, PostType.REEL, PostType.LINK]
+        return [PostType.TEXT, PostType.IMAGE, PostType.VIDEO, PostType.REEL, PostType.STORY, PostType.LINK]
 
     @property
     def supported_media_types(self) -> list[MediaType]:
@@ -310,6 +313,8 @@ class FacebookProvider(SocialProvider):
                 retryable=False,
             )
 
+        if content.post_type == PostType.STORY:
+            return self._publish_story(access_token, page_id, content)
         if content.post_type == PostType.IMAGE and content.media_urls:
             return self._publish_photo(access_token, page_id, content)
         if content.post_type == PostType.REEL:
@@ -575,6 +580,134 @@ class FacebookProvider(SocialProvider):
             # clone whose media may no longer be a single video, and
             # start_data's "upload_url", a signed rupload URL that has no
             # business being persisted.
+            extra={
+                "video_id": video_id,
+                **{k: v for k, v in video_fields.items() if k in ("post_id", "permalink_url")},
+            },
+        )
+
+    def _publish_story(self, access_token: str, page_id: str, content: PublishContent) -> PublishResult:
+        """Publish a Page Story: an unpublished photo, or the video start/upload/finish flow."""
+        if len(content.media_urls) != 1:
+            raise PublishError(
+                "Facebook Stories require exactly one image or video",
+                platform=self.platform_name,
+                retryable=False,
+            )
+        if content.is_video(0):
+            return self._publish_video_story(access_token, page_id, content)
+        return self._publish_photo_story(access_token, page_id, content)
+
+    def _publish_photo_story(self, access_token: str, page_id: str, content: PublishContent) -> PublishResult:
+        """Upload an unpublished photo, then publish it with /{page-id}/photo_stories.
+
+        Stories do not show a caption, so the staged photo is uploaded without
+        a message. The unpublished photo is deleted if the story call fails,
+        so a retry does not leave orphaned media on the Page.
+        """
+        photo_id = ""
+        try:
+            staged = self._request(
+                "POST",
+                f"{BASE_URL}/{page_id}/photos",
+                access_token=access_token,
+                json={"url": content.media_urls[0], "published": False},
+            ).json()
+            photo_id = staged.get("id") or ""
+            if not photo_id:
+                raise PublishError(
+                    "Facebook did not accept the photo for a Story",
+                    platform=self.platform_name,
+                    raw_response=staged,
+                )
+            data = self._request(
+                "POST",
+                f"{BASE_URL}/{page_id}/photo_stories",
+                access_token=access_token,
+                json={"photo_id": photo_id},
+            ).json()
+            self._raise_for_reel_phase(data, "publish the photo Story")
+            graph_post_id = data.get("post_id") or data.get("id")
+            if not graph_post_id:
+                raise PublishError(
+                    "Facebook did not return an id for the photo Story",
+                    platform=self.platform_name,
+                    raw_response=data,
+                )
+        except Exception:
+            if photo_id:
+                self._delete_staged_photos(access_token, [photo_id])
+            raise
+
+        return PublishResult(
+            platform_post_id=self._stored_post_id(str(graph_post_id)),
+            url=f"https://www.facebook.com/{graph_post_id}",
+            extra={"photo_id": photo_id, "post_id": graph_post_id},
+        )
+
+    def _publish_video_story(self, access_token: str, page_id: str, content: PublishContent) -> PublishResult:
+        """Publish a video Story via /{page-id}/video_stories (start, upload, finish).
+
+        The upload host and headers match Page Reels: Meta fetches ``file_url``
+        itself. No caption is sent — a Story does not display one.
+        """
+        if content.video_duration_sec is not None and content.video_duration_sec > FACEBOOK_STORY_MAX_DURATION_SEC:
+            raise PublishError(
+                "Facebook video Stories must be 60 seconds or shorter",
+                platform=self.platform_name,
+                retryable=False,
+            )
+
+        start_data = self._request(
+            "POST",
+            f"{BASE_URL}/{page_id}/video_stories",
+            access_token=access_token,
+            data={"upload_phase": "start"},
+        ).json()
+        video_id = start_data.get("video_id")
+        upload_url = start_data.get("upload_url")
+        if not video_id or not upload_url:
+            raise PublishError(
+                "Facebook did not create a Story video upload session",
+                platform=self.platform_name,
+                raw_response=start_data,
+            )
+
+        upload_resp = self._request(
+            "POST",
+            upload_url,
+            headers={
+                "Authorization": f"OAuth {access_token}",
+                "file_url": content.media_urls[0],
+            },
+        )
+        self._raise_for_reel_phase(self._safe_json(upload_resp), "upload the Story video")
+
+        finish_data = self._request(
+            "POST",
+            f"{BASE_URL}/{page_id}/video_stories",
+            access_token=access_token,
+            data={"upload_phase": "finish", "video_id": video_id},
+        ).json()
+        self._raise_for_reel_phase(finish_data, "publish the video Story")
+
+        video_fields: dict = {}
+        try:
+            video_fields = self._request(
+                "GET",
+                f"{BASE_URL}/{video_id}",
+                access_token=access_token,
+                params={"fields": "post_id,permalink_url"},
+            ).json()
+        except Exception as exc:
+            logger.debug("Facebook Story video %s post_id unavailable: %s", video_id, exc)
+
+        graph_post_id = video_fields.get("post_id") or finish_data.get("post_id") or video_id
+        return PublishResult(
+            platform_post_id=self._stored_post_id(str(graph_post_id)),
+            url=video_fields.get("permalink_url") or f"https://www.facebook.com/stories/{video_id}",
+            # Identifiers only. ``platform_extra`` is republished as input, so
+            # a ``post_type`` echo would force the next clone to be a Story.
             extra={
                 "video_id": video_id,
                 **{k: v for k, v in video_fields.items() if k in ("post_id", "permalink_url")},
