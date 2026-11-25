@@ -41,6 +41,7 @@ from apps.api.schemas import (
 )
 from apps.composer.models import Post
 from apps.composer.services import (
+    assign_publish_format,
     create_post,
     media_change_blocker,
     sync_post_scheduled_at,
@@ -256,6 +257,7 @@ def create(request, payload: CreatePostRequest):
             author=request.user if not request.user.is_anonymous else None,
             status="scheduled" if payload.action == "schedule" else "draft",
             platform_overrides=platform_overrides,
+            post_type=payload.post_type,
         )
         body = _post_to_response(request, post)
         status_code = 201
@@ -347,8 +349,12 @@ def update(request, post_id: uuid.UUID, payload: UpdatePostRequest):
         # swapping a TikTok post's video for an image, or emptying a pin's
         # media, would leave it queued to fail after the schedule route had
         # checked it.
+        usable_after = [resolved_assets[mid] for mid in wanted_media if resolved_assets[mid].file]
         reason = media_change_blocker(
-            post, media_types_after=usable_media_types(resolved_assets[mid] for mid in wanted_media)
+            post,
+            media_types_after=usable_media_types(usable_after),
+            media_count_after=len(usable_after),
+            format_override=payload.post_type,
         )
         if reason:
             raise HttpError(422, reason)
@@ -401,6 +407,14 @@ def update(request, post_id: uuid.UUID, payload: UpdatePostRequest):
         if update_fields:
             post.save(update_fields=[*update_fields, "updated_at"])
 
+        if payload.post_type is not None:
+            # After the media swap, so a Story or Reel is checked against the
+            # attachments this request leaves on the post.
+            try:
+                assign_publish_format(post, payload.post_type)
+            except ValueError as exc:
+                raise HttpError(422, str(exc)) from exc
+
         sync_post_scheduled_at(post)
 
     post.refresh_from_db()
@@ -440,7 +454,15 @@ def schedule(request, post_id: uuid.UUID, payload: ScheduleRequest):
     from django.db import transaction
 
     with transaction.atomic():
+        if payload.post_type is not None:
+            try:
+                assign_publish_format(post, payload.post_type)
+            except ValueError as exc:
+                raise HttpError(422, str(exc)) from exc
         for pp in drafts:
+            # assign_publish_format saved the children; re-read so the
+            # transition sees the Story or Reel hint it just stored.
+            pp.refresh_from_db()
             try:
                 transition_platform_post(pp, "scheduled", scheduled_at=payload.scheduled_at)
             except ValueError as exc:

@@ -27,7 +27,7 @@ from apps.api.limits import check_platform_quota
 from apps.api.pagination import decode_offset_cursor, encode_offset_cursor
 from apps.api.schemas import PostResponse
 from apps.composer.models import PlatformPost, Post
-from apps.composer.services import create_post, transition_platform_post
+from apps.composer.services import assign_publish_format, create_post, transition_platform_post
 from apps.inbox.models import InboxMessage, InboxReply
 from apps.inbox.services import (
     ReplyStateError,
@@ -226,6 +226,30 @@ register_tool(
 # ---------------------------------------------------------------------------
 
 
+_POST_TYPE_PROPERTY = {
+    "type": "string",
+    "enum": ["feed", "reel", "story"],
+    "description": (
+        "Optional. Instagram and Facebook only. "
+        "`feed` is today's default: a feed image, a regular Facebook video, or an Instagram Reel "
+        "when the only attachment is a video. "
+        "`reel` publishes exactly one video as a Reel. "
+        "`story` publishes exactly one image or video as a Story. "
+        "Omit the field to leave a saved choice unchanged. "
+        "Stories and Reels count toward the same per-account 24h cap (Instagram 25)."
+    ),
+}
+
+
+def _post_type_arg(args: dict) -> str | None:
+    value = args.get("post_type")
+    if value is None:
+        return None
+    if value not in ("feed", "reel", "story"):
+        raise JsonRpcError(INVALID_PARAMS, "post_type must be one of: feed, reel, story.")
+    return value
+
+
 def _create_draft(args: dict, context: dict[str, Any]) -> dict:
     _require_perm(context, "create_posts")
     api_key = context["api_key"]
@@ -249,6 +273,7 @@ def _create_draft(args: dict, context: dict[str, Any]) -> dict:
             proposed_publish_at=proposed_publish_at,
             author=api_key.issued_by if api_key.issued_by_id else None,
             status="draft",
+            post_type=_post_type_arg(args),
         )
     except ValueError as exc:
         raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
@@ -298,6 +323,7 @@ register_tool(
                         "not validated against the future, and never queued for publishing."
                     ),
                 },
+                "post_type": _POST_TYPE_PROPERTY,
             },
             "required": ["social_account_id", "caption"],
             "additionalProperties": False,
@@ -350,6 +376,7 @@ def _schedule_post(args: dict, context: dict[str, Any]) -> dict:
             scheduled_at=scheduled_at,
             author=api_key.issued_by if api_key.issued_by_id else None,
             status="scheduled",
+            post_type=_post_type_arg(args),
         )
     except ValueError as exc:
         raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
@@ -388,6 +415,7 @@ register_tool(
                     "items": {"type": "string", "format": "uuid"},
                     "default": [],
                 },
+                "post_type": _POST_TYPE_PROPERTY,
             },
             "required": ["social_account_id", "caption", "scheduled_at"],
             "additionalProperties": False,
@@ -619,8 +647,15 @@ def _schedule_draft(args: dict, context: dict[str, Any]) -> dict:
     # transition, state-machine rejection on a later child, workspace
     # approval-mode rejection from ``transition_platform_post``) rolls
     # back any earlier ``scheduled`` commits.
+    post_type = _post_type_arg(args)
     with transaction.atomic():
+        if post_type is not None:
+            try:
+                assign_publish_format(post, post_type)
+            except ValueError as exc:
+                raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
         for pp in drafts:
+            pp.refresh_from_db()
             try:
                 transition_platform_post(pp, "scheduled", scheduled_at=scheduled_at)
             except ValueError as exc:
@@ -649,6 +684,7 @@ register_tool(
                     "type": "string",
                     "description": "ISO 8601 UTC timestamp (e.g. 2026-06-01T14:00:00Z)",
                 },
+                "post_type": _POST_TYPE_PROPERTY,
             },
             "required": ["post_id", "scheduled_at"],
             "additionalProperties": False,

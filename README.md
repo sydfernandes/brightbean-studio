@@ -830,6 +830,36 @@ Don't poll faster than the data changes. Studio syncs the inbox every 5 minutes 
 
 Post creation, media uploads, and inbox reply creation accept `idempotency_key` (or `Idempotency-Key` header) for safe retries.
 
+### Instagram and Facebook: Feed, Reel, or Story
+
+`POST /posts`, `PATCH /posts/{post_id}`, and `POST /posts/{post_id}/schedule` take an optional `post_type` of `feed`, `reel`, or `story`. The same field is on the MCP tools `create_draft`, `schedule_post`, and `schedule_draft`. It is stored per platform on the existing post extras, so there is no database migration.
+
+| Value | What gets published |
+|---|---|
+| `feed` (or omit) | Today's default. An image goes to the feed. A Facebook video stays a regular Page video. A single Instagram video is a Reel, because Instagram has no separate feed video. |
+| `reel` | Exactly one video, published as a Reel. |
+| `story` | Exactly one image or video, published as a Story. Instagram uses a media container with `media_type=STORIES` (`image_url` or `video_url`; video containers are polled until they finish before `media_publish`). Facebook uploads an unpublished photo and calls `/{page-id}/photo_stories`, or runs start/upload/finish on `/{page-id}/video_stories`. |
+
+Other platforms reject the field. A Reel or Story whose media no longer fits (nothing attached, or more than one file) is refused with `422` instead of being posted to the feed. Stories and Reels count toward the same per-account rolling 24-hour cap as any other post — Instagram stays at 25.
+
+The Meta permissions are the ones Studio already requests: `instagram_content_publish` (Facebook Login) or `instagram_business_content_publish` (Instagram Login), and `pages_manage_posts` for Facebook Page Stories (along with `pages_show_list` and `pages_read_engagement`). A token connected before those were granted has to be reconnected; no new scope was added.
+
+```bash
+curl -X POST "$APP_URL/api/v1/posts/" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "social_account_id": "INSTAGRAM_ACCOUNT_UUID",
+    "caption": "Behind the scenes",
+    "media_asset_ids": ["IMAGE_OR_VIDEO_UUID"],
+    "post_type": "story",
+    "action": "schedule",
+    "scheduled_at": "2026-06-01T14:00:00Z"
+  }'
+```
+
+A Facebook Story that carries a video uses the same body with the Facebook Page's `social_account_id`, a video `media_asset_ids` entry, and `"post_type": "story"`. The composer shows the same Feed / Reel / Story choice on each Instagram and Facebook channel. Feed is the default, except a single Instagram video, which already publishes as a Reel.
+
 For inbox reply creation, reuse the same key and request to replay the original response without creating or sending another reply. A failed create-and-send response is replayed too; retrieve the retained failed reply from the message thread and retry delivery via `/inbox/replies/{reply_id}/send`.
 
 ### MCP Tools

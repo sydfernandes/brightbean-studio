@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Literal
 from ninja import Field, Schema
 from pydantic import field_serializer
 
+from apps.composer.services import public_post_type
 from providers import is_video_only, requires_media
 
 if TYPE_CHECKING:
@@ -143,6 +144,22 @@ class AccountsListResponse(Schema):
 
 
 PostAction = Literal["draft", "schedule"]
+PublishFormat = Literal["feed", "reel", "story"]
+
+# Shared by create, update, and schedule so the OpenAPI descriptions cannot drift.
+_POST_TYPE_DESCRIPTION = (
+    "How this post is published on Instagram or Facebook. "
+    "`feed` is today's default: a feed image, a regular Facebook Page video, "
+    "or an Instagram Reel when the only attachment is a video. "
+    "`reel` publishes exactly one video as a Reel. "
+    "`story` publishes exactly one image or video as a Story "
+    "(Instagram container `media_type=STORIES`; Facebook `/{page-id}/photo_stories` "
+    "or `/{page-id}/video_stories`). "
+    "Omit the field to leave a saved choice unchanged. "
+    "Sending it for any other platform is a 422. "
+    "Stories and Reels count toward the same per-account rolling 24h cap as feed posts "
+    "(Instagram 25)."
+)
 
 
 class PlatformOverride(Schema):
@@ -239,6 +256,10 @@ class CreatePostRequest(Schema):
         max_length=128,
         description="Optional client-chosen retry key. Same key + same body → replay first response.",
     )
+    post_type: PublishFormat | None = Field(
+        None,
+        description=_POST_TYPE_DESCRIPTION,
+    )
 
 
 class UpdatePostRequest(Schema):
@@ -259,10 +280,18 @@ class UpdatePostRequest(Schema):
         None,
         description="Set a draft's suggested publish time (UTC). Sending null is a no-op (cannot clear via PATCH).",
     )
+    post_type: PublishFormat | None = Field(
+        None,
+        description=_POST_TYPE_DESCRIPTION,
+    )
 
 
 class ScheduleRequest(Schema):
     scheduled_at: dt.datetime = Field(..., description="UTC timestamp at which the publisher should fire the post.")
+    post_type: PublishFormat | None = Field(
+        None,
+        description=_POST_TYPE_DESCRIPTION + " Applied before the draft is queued.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +308,10 @@ class PlatformPostSummary(Schema):
     published_at: dt.datetime | None
     platform_post_id: str = ""
     publish_error: str = ""
+    post_type: str = Field(
+        "feed",
+        description="feed, reel, or story. feed when no Reel or Story was chosen.",
+    )
 
     @field_serializer("scheduled_at", "published_at")
     def _serialize_dt(self, value: dt.datetime | None) -> str | None:
@@ -295,6 +328,7 @@ class PlatformPostSummary(Schema):
             published_at=pp.published_at,
             platform_post_id=pp.platform_post_id or "",
             publish_error=pp.publish_error or "",
+            post_type=public_post_type(pp.platform_extra),
         )
 
 

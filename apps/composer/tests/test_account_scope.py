@@ -401,6 +401,130 @@ class FacebookVideoSettingsTests(AccountScopeTestsBase):
         self.facebook_pp.refresh_from_db()
         self.assertNotIn("post_type", self.facebook_pp.platform_extra)
 
+    def test_facebook_story_choice_round_trips_into_platform_extra(self):
+        response = self.client.post(self.save_url, data=self._facebook_payload("story"))
+
+        self.assertIn(response.status_code, (200, 204, 302))
+        self.facebook_pp.refresh_from_db()
+        self.assertEqual(self.facebook_pp.platform_extra["post_type"], "story")
+
+    def test_feed_choice_clears_a_story_hint(self):
+        self.facebook_pp.platform_extra = {"post_type": "story", "audience": "public"}
+        self.facebook_pp.save(update_fields=["platform_extra"])
+
+        response = self.client.post(self.save_url, data=self._facebook_payload("feed"))
+
+        self.assertIn(response.status_code, (200, 204, 302))
+        self.facebook_pp.refresh_from_db()
+        self.assertEqual(self.facebook_pp.platform_extra, {"audience": "public"})
+
+    def test_facebook_story_is_cleared_when_a_second_attachment_arrives(self):
+        image = MediaAsset.objects.create(
+            organization=self.org,
+            workspace=self.workspace,
+            uploaded_by=self.user,
+            file="test/facebook-story-extra.jpg",
+            filename="facebook-story-extra.jpg",
+            media_type=MediaAsset.MediaType.IMAGE,
+            mime_type="image/jpeg",
+        )
+        PostMedia.objects.create(post=self.post, media_asset=image, position=1)
+
+        response = self.client.post(self.save_url, data=self._facebook_payload("story"))
+
+        self.assertIn(response.status_code, (200, 204, 302))
+        self.facebook_pp.refresh_from_db()
+        self.assertNotIn("post_type", self.facebook_pp.platform_extra or {})
+
+
+class InstagramStorySettingsTests(AccountScopeTestsBase):
+    def setUp(self):
+        super().setUp()
+        self.instagram = SocialAccount.objects.create(
+            workspace=self.workspace,
+            platform="instagram_login",
+            account_platform_id="ig-user-1",
+            account_name="Instagram",
+            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
+        )
+        self.ig_pp = PlatformPost.objects.create(
+            post=self.post,
+            social_account=self.instagram,
+            status=PlatformPost.Status.DRAFT,
+        )
+        self.image = MediaAsset.objects.create(
+            organization=self.org,
+            workspace=self.workspace,
+            uploaded_by=self.user,
+            file="test/ig-story.jpg",
+            filename="ig-story.jpg",
+            media_type=MediaAsset.MediaType.IMAGE,
+            mime_type="image/jpeg",
+        )
+        PostMedia.objects.create(post=self.post, media_asset=self.image)
+
+    def _instagram_payload(self, post_type=None):
+        account_id = str(self.instagram.id)
+        fields = {f"instagram_panel_{account_id}": "1"}
+        if post_type is not None:
+            fields[f"instagram_post_type_{account_id}"] = post_type
+        return self._payload(
+            selected_accounts=account_id,
+            account_scope=account_id,
+            **fields,
+        )
+
+    def test_story_choice_round_trips_for_instagram_login(self):
+        response = self.client.post(self.save_url, data=self._instagram_payload("story"))
+
+        self.assertIn(response.status_code, (200, 204, 302))
+        self.ig_pp.refresh_from_db()
+        self.assertEqual(self.ig_pp.platform_extra["post_type"], "story")
+
+    def test_feed_choice_does_not_store_a_hint(self):
+        self.ig_pp.platform_extra = {"post_type": "story"}
+        self.ig_pp.save(update_fields=["platform_extra"])
+
+        response = self.client.post(self.save_url, data=self._instagram_payload("feed"))
+
+        self.assertIn(response.status_code, (200, 204, 302))
+        self.ig_pp.refresh_from_db()
+        self.assertNotIn("post_type", self.ig_pp.platform_extra)
+
+    def test_reel_is_stored_for_a_single_video(self):
+        self.image.delete()
+        self.post.media_attachments.all().delete()
+        video = MediaAsset.objects.create(
+            organization=self.org,
+            workspace=self.workspace,
+            uploaded_by=self.user,
+            file="test/ig-reel.mp4",
+            filename="ig-reel.mp4",
+            media_type=MediaAsset.MediaType.VIDEO,
+            mime_type="video/mp4",
+        )
+        PostMedia.objects.create(post=self.post, media_asset=video)
+
+        response = self.client.post(self.save_url, data=self._instagram_payload("reel"))
+
+        self.assertIn(response.status_code, (200, 204, 302))
+        self.ig_pp.refresh_from_db()
+        self.assertEqual(self.ig_pp.platform_extra["post_type"], "reel")
+
+    def test_a_save_without_the_panel_leaves_the_story(self):
+        self.ig_pp.platform_extra = {"post_type": "story"}
+        self.ig_pp.save(update_fields=["platform_extra"])
+        account_id = str(self.instagram.id)
+
+        response = self.client.post(
+            self.save_url,
+            data=self._payload(selected_accounts=account_id, account_scope=account_id),
+        )
+
+        self.assertIn(response.status_code, (200, 204, 302))
+        self.ig_pp.refresh_from_db()
+        self.assertEqual(self.ig_pp.platform_extra, {"post_type": "story"})
+
 
 class PinterestBoardSelectionTests(AccountScopeTestsBase):
     def setUp(self):
